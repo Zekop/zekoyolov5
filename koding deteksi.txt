@@ -1,0 +1,260 @@
+# ================== SORT TRACKER ==================
+import numpy as np
+from collections import deque
+
+class KalmanBoxTracker:
+    count = 0
+    def __init__(self, bbox):
+        self.id = KalmanBoxTracker.count
+        KalmanBoxTracker.count += 1
+        self.bbox = bbox
+        self.hits = 0
+        self.no_losses = 0
+
+    def update(self, bbox):
+        self.bbox = bbox
+        self.hits += 1
+
+    def predict(self):
+        return self.bbox
+
+class Sort:
+    def __init__(self, max_age=30, min_hits=3):
+        self.max_age = max_age
+        self.min_hits = min_hits
+        self.trackers = []
+
+    def update(self, dets=np.empty((0, 5))):
+        updated_trackers = []
+        for trk in self.trackers:
+            trk.no_losses += 1
+
+        for det in dets:
+            matched = False
+            for trk in self.trackers:
+                if self.iou(det, trk.predict()) > 0.3:
+                    trk.update(det)
+                    trk.no_losses = 0
+                    matched = True
+                    break
+            if not matched:
+                trk = KalmanBoxTracker(det)
+                self.trackers.append(trk)
+
+        self.trackers = [trk for trk in self.trackers if trk.no_losses <= self.max_age]
+
+        return np.array([[trk.bbox[0], trk.bbox[1], trk.bbox[2], trk.bbox[3], trk.id] for trk in self.trackers])
+
+    def iou(self, bb_test, bb_gt):
+        xx1 = np.maximum(bb_test[0], bb_gt[0])
+        yy1 = np.maximum(bb_test[1], bb_gt[1])
+        xx2 = np.minimum(bb_test[2], bb_gt[2])
+        yy2 = np.minimum(bb_test[3], bb_gt[3])
+        w = np.maximum(0., xx2 - xx1)
+        h = np.maximum(0., yy2 - yy1)
+        wh = w * h
+        o = wh / ((bb_test[2]-bb_test[0])*(bb_test[3]-bb_test[1]) + (bb_gt[2]-bb_gt[0])*(bb_gt[3]-bb_gt[1]) - wh)
+        return o
+
+# ================== YOLOv5 DETECTION ==================
+import argparse
+import os
+import platform
+import sys
+import time
+from pathlib import Path
+
+import torch
+import cv2
+
+from models.common import DetectMultiBackend
+from utils.dataloaders import LoadImages, LoadStreams
+from utils.general import (
+    check_img_size, check_imshow, non_max_suppression, scale_boxes,
+    increment_path, LOGGER, colorstr
+)
+from utils.torch_utils import select_device
+from ultralytics.utils.plotting import Annotator, colors
+
+def run(
+    weights='yolov5s.pt',
+    source='data/images',
+    imgsz=(640, 640),
+    conf_thres=0.25,
+    iou_thres=0.45,
+    device='',
+    view_img=False,
+    save_img=False,
+    project='runs/detect',
+    name='exp',
+    exist_ok=False,
+    vid_stride=1,
+):
+    source = str(source)
+    save_dir = increment_path(Path(project) / name, exist_ok=exist_ok)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    device = select_device(device)
+    model = DetectMultiBackend(weights, device=device)
+    stride, names, pt = model.stride, model.names, model.pt
+    imgsz = check_img_size(imgsz, s=stride)
+
+    is_webcam = source.isnumeric() or source.endswith('.streams')
+
+    if is_webcam:
+        dataset = LoadStreams(source, img_size=imgsz, stride=stride, auto=pt)
+    else:
+        dataset = LoadImages(source, img_size=imgsz, stride=stride, auto=pt, vid_stride=vid_stride)
+
+    vid_path, vid_writer = [None] * len(dataset), [None] * len(dataset)
+
+    model.warmup(imgsz=(1 if pt else len(dataset), 3, *imgsz))
+
+    tracker = Sort()
+    already_counted = set()
+    detection_counts = {}
+
+    for path, im, im0s, vid_cap, s in dataset:
+        start_time = time.time()
+
+        im = torch.from_numpy(im).to(device)
+        im = im.half() if model.fp16 else im.float()
+        im /= 255
+        if len(im.shape) == 3:
+            im = im[None]
+
+        pred = model(im, augment=False)
+        pred = non_max_suppression(pred, conf_thres, iou_thres)
+
+        for i, det in enumerate(pred):
+            if is_webcam:
+                p, im0 = path[i], im0s[i].copy()
+            else:
+                p, im0 = path, im0s.copy()
+
+            original_frame = im0.copy()
+
+            annotator = Annotator(im0, line_width=2, example=str(names))
+
+            if len(det):
+                det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()
+                det_cpu = det.cpu().numpy()
+                tracks = tracker.update(det_cpu)
+
+                for track in tracks:
+                    x1, y1, x2, y2, track_id = track
+                    track_id = int(track_id)
+
+                    # Cari class berdasarkan IoU terbaik
+                    best_iou = 0
+                    best_cls = None
+                    for d in det_cpu:
+                        dx1, dy1, dx2, dy2, conf, cls = d
+                        iou = (
+                            max(0, min(x2, dx2) - max(x1, dx1)) *
+                            max(0, min(y2, dy2) - max(y1, dy1))
+                        ) / (
+                            (x2 - x1) * (y2 - y1) +
+                            (dx2 - dx1) * (dy2 - dy1) -
+                            max(0, min(x2, dx2) - max(x1, dx1)) *
+                            max(0, min(y2, dy2) - max(y1, dy1))
+                        )
+                        if iou > best_iou:
+                            best_iou = iou
+                            best_cls = int(cls)
+
+                    if best_cls is not None:
+                        class_name = names[best_cls]
+                        unique_id = f"{class_name}-{track_id}"
+
+                        if unique_id not in already_counted:
+                            already_counted.add(unique_id)
+                            detection_counts[class_name] = detection_counts.get(class_name, 0) + 1
+
+                        label = f'{class_name} ID-{track_id}'
+                        annotator.box_label([x1, y1, x2, y2], label, color=colors(best_cls, True))
+
+            detected_frame = annotator.result()
+
+            resize_scale = 0.5
+            original_frame_resized = cv2.resize(original_frame, (int(original_frame.shape[1] * resize_scale), int(original_frame.shape[0] * resize_scale)))
+            detected_frame_resized = cv2.resize(detected_frame, (int(detected_frame.shape[1] * resize_scale), int(detected_frame.shape[0] * resize_scale)))
+
+            label_font = cv2.FONT_HERSHEY_SIMPLEX
+            label_scale = 0.8
+            label_color = (255, 255, 255)
+            label_thickness = 2
+
+            cv2.putText(original_frame_resized, 'Original', (10, 30), label_font, label_scale, label_color, label_thickness, cv2.LINE_AA)
+            cv2.putText(detected_frame_resized, 'Detected', (10, 30), label_font, label_scale, label_color, label_thickness, cv2.LINE_AA)
+
+            combined_frame = cv2.hconcat([original_frame_resized, detected_frame_resized])
+
+            fps = 1.0 / (time.time() - start_time)
+            fps_text = f"FPS: {fps:.2f}"
+            cv2.putText(combined_frame, fps_text, (10, combined_frame.shape[0] - 10), label_font, 0.7, (0, 255, 0), 2)
+
+            if view_img:
+                window_name = 'Dual View Detection'
+                if platform.system() == 'Linux':
+                    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+                cv2.imshow(window_name, combined_frame)
+                if cv2.waitKey(1) == ord('q'):
+                    break
+
+            if save_img:
+                if dataset.mode == 'image':
+                    cv2.imwrite(str(save_dir / Path(p).name), combined_frame)
+                else:
+                    if vid_path[i] != str(save_dir / Path(p).name):
+                        vid_path[i] = str(save_dir / Path(p).name)
+                        if isinstance(vid_writer[i], cv2.VideoWriter):
+                            vid_writer[i].release()
+                        if vid_cap:
+                            fps_v = vid_cap.get(cv2.CAP_PROP_FPS)
+                            w = combined_frame.shape[1]
+                            h = combined_frame.shape[0]
+                        else:
+                            fps_v, w, h = 30, combined_frame.shape[1], combined_frame.shape[0]
+                        save_path_video = str(Path(vid_path[i]).with_suffix('.mp4'))
+                        vid_writer[i] = cv2.VideoWriter(save_path_video, cv2.VideoWriter_fourcc(*'mp4v'), fps_v, (w, h))
+                    vid_writer[i].write(combined_frame)
+
+    # Print jumlah deteksi
+    print("\nHasil jumlah deteksi:")
+    for class_name, count in detection_counts.items():
+        print(f"{class_name}: {count}")
+
+    # ========== ❗ TAMBAHAN AGAR JENDELA TIDAK LANGSUNG TERTUTUP ❗ ==========
+    if view_img:
+        print("\nTekan tombol 'q' atau close window untuk keluar...")
+        while True:
+            if cv2.waitKey(1) & 0xFF == ord('q') or cv2.getWindowProperty('Dual View Detection', cv2.WND_PROP_VISIBLE) < 1:
+                break
+
+        cv2.destroyAllWindows()
+
+def parse_opt():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--weights', nargs='+', type=str, default='yolov5s.pt', help='model path')
+    parser.add_argument('--source', type=str, default='data/images', help='file/dir/URL/glob, 0 for webcam')
+    parser.add_argument('--imgsz', '--img', '--img-size', nargs='+', type=int, default=[640], help='inference size h,w')
+    parser.add_argument('--conf-thres', type=float, default=0.25, help='confidence threshold')
+    parser.add_argument('--iou-thres', type=float, default=0.45, help='NMS IoU threshold')
+    parser.add_argument('--device', default='', help='cuda device, i.e. 0 or cpu')
+    parser.add_argument('--view-img', action='store_true', help='show results')
+    parser.add_argument('--save-img', action='store_true', help='save results')
+    parser.add_argument('--project', default='runs/detect', help='save to project/name')
+    parser.add_argument('--name', default='exp', help='save to project/name')
+    parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
+    parser.add_argument('--vid-stride', type=int, default=1, help='video frame-rate stride')
+    opt = parser.parse_args()
+    opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1
+    return opt
+
+def main(opt):
+    run(**vars(opt))
+
+if __name__ == "__main__":
+    opt = parse_opt()
+    main(opt)
